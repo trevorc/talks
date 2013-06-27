@@ -1,0 +1,608 @@
+# -*- mode: org -*-
+#+TITLE: I accidentally the entire heap
+#+AUTHOR: Trevor Caira
+#+DATE: June 26, 2013
+#+EMAIL: trevor@bitba.se
+#+OPTIONS: toc:nil
+#+STARTUP: beamer
+#+LaTeX_CLASS: beamer
+#+LaTeX_CLASS_OPTIONS: [bigger]
+#+LaTeX_HEADER: \subtitle{Or: how I learned to stop worrying
+#+LaTeX_HEADER:           and love the profiler.}
+#+LaTeX_HEADER: \institute{Bitbase LLC}
+#+LaTeX_HEADER: \usetheme{Warsaw}
+#+LATEX_HEADER: \setbeamertemplate{navigation symbols}{}
+#+LaTeX_HEADER: \useoutertheme{infolines}
+#+LaTeX_HEADER: \AtBeginSection[]{\begin{frame}<beamer>\frametitle{Topic}\tableofcontents[currentsection]\end{frame}}
+#+BEAMER_FRAME_LEVEL: 2
+
+* Introduction
+
+** Laziness and Space Leaks
+
+- This is not a highly theoretical talk
+- I will be giving practical advice on how to debug space leaks caused
+  by lazy evaluation
+
+** Overview
+
+- First I will briefly review how Haskell programs are evaluated by
+  example
+- Then I will go over a plausible example of debugging a program with
+  space leaks
+
+* Haskell Evaluation
+
+** Whirlwind tour
+
+- Principles governing Haskell evaluation are simple
+- Still, a proper treatment is the subject of its own talk
+- Consult the Haskell wiki article on Graph Reduction
+
+** Non-strictness
+
+- Haskell values are non-strict
+- Not evaluated until actually needed
+- That is, only pattern matching or I/O primitives can cause evaluation
+
+** Evaluation Relationship
+
+- All evaluation in a Haskell program is ultimately rooted at the
+  ~main~ top-level binding
+- Strictness is most usefully thought of as a relationship
+
+#+BEGIN_SRC haskell
+  case xs of
+    [] -> True
+    _  -> False
+#+END_SRC
+
+- This expression is strict in xs
+  - But not in the head or tail of xs
+  - Only the outer cons cell is evaluated
+  - Still yields a value given an infinite list
+
+** Laziness
+
+- Non-strictness in GHC is done with laziness + sharing
+- Laziness means expressions are suspended in thunks
+  - Thunk = eventual value or non-termination
+- Sharing means expressions are evaluated once per name
+
+#+BEGIN_SRC haskell
+  square x = x * x
+  main = print $ square (fibs !! 10000)
+#+END_SRC
+
+- ~fibs !! 10000~ is only computed once
+
+** Simple Example
+
+Let's consider the evaluation of
+#+BEGIN_SRC haskell
+  and (repeat False)
+#+END_SRC
+- Like any Haskell expression, it starts out life as a thunk
+- When evaluated, we get:
+#+BEGIN_SRC haskell
+  and <thunk: repeat False>
+#+END_SRC
+- I represent thunks in angle brackets with the code that yields
+  their value
+
+** Simple Example (cont'd)
+
+To move forward, let's consult the definition of ~and~:
+
+#+BEGIN_SRC haskell
+  and xs = case xs of
+             [] -> True
+             (h:t) -> h && and t
+#+END_SRC
+
+Given our evaluated value so far:
+
+#+BEGIN_SRC haskell
+  and <thunk: repeat False>
+#+END_SRC
+
+Substituting the definition of ~and~ yields us:
+
+#+BEGIN_SRC haskell
+  case <thunk: repeat False> of
+    [] -> True
+    (h:t) -> h && and t
+#+END_SRC
+
+** Simple Example (cont'd)
+
+This is a pattern match. We must evaluate our thunk. Consulting the
+definition of ~repeat~:
+
+#+BEGIN_SRC haskell
+  repeat x = x : repeat x
+#+END_SRC
+
+Given our evaluation so far:
+
+#+BEGIN_SRC haskell
+  case <thunk: repeat False> of
+    [] -> True
+    (h:t) -> h && and t
+#+END_SRC
+
+Substituting the definition of ~repeat~ yields:
+
+#+BEGIN_SRC haskell
+  case <thunk: False> : <thunk: repeat False> of
+    [] -> True
+    (h:t) -> h && and t
+#+END_SRC
+
+** Simple Example (cont'd)
+
+Here, the second pattern matches:
+
+#+BEGIN_SRC haskell
+    (h:t) -> h && and t
+#+END_SRC
+
+Substituting the variables $h$ and $t$ yields:
+
+#+BEGIN_SRC haskell
+  <thunk: False> && <thunk: and <thunk: repeat False>>
+#+END_SRC
+
+** Simple Example (cont'd)
+
+Now we're ready to apply ~(&&)~, given below:
+
+#+BEGIN_SRC haskell
+  x && y = case x of
+             True -> y
+             False -> False
+#+END_SRC
+
+to our value so far:
+
+#+BEGIN_SRC haskell
+  <thunk: False> && <thunk: and <thunk: repeat False>>
+#+END_SRC
+
+yielding:
+
+#+BEGIN_SRC haskell
+  case <thunk: False> of
+    True -> <thunk: and <thunk: repeat False>>
+    False -> False
+#+END_SRC
+
+** Simple Example (cont'd)
+
+Evaluating this thunk yields ~False~, of course matching the second
+pattern.
+
+- Note that second argument to ~(&&)~ is never evaluated.
+- Since we never evaluate the tail of ~repeat False~, the program terminates.
+
+** Wrapping Up Evaluation
+
+This was only a simple example to motivate the feel of programming
+with laziness. Much more information is available in the Haskell
+report and Haskell wiki.
+
+* Inverted Index
+
+** A Concrete Example
+
+Let's explore the challenges of laziness with a concrete, believable
+example.
+
+** Problem Statement
+
+- Task at hand: build and query an inverted index
+- An inverted index maps content (words) to documents
+- We'll build a record-level inverted index
+- Spoiler alert: laziness will get in our way
+
+** Inverted Index
+
+- Map of terms to documents they occur in
+- ~AND~ query is the intersection of documents referenced by the terms
+  in the query
+
+* Naive Implementation
+
+** Starting out
+
+We'll make a first attempt at building an inverted index starting with
+an obvious, naive implementation.
+
+** Data Model
+
+#+BEGIN_SRC haskell
+  type Term = String
+#+END_SRC
+
+We model terms (and documents) with ~String~.
+
+#+BEGIN_SRC haskell
+  type Index = Map Term (Set FilePath)
+#+END_SRC
+
+An index is simply a map of terms to the set of documents they occur in.
+
+** String
+
+Recall the definition of ~String~:
+
+#+BEGIN_SRC haskell
+type String = [Char]
+#+END_SRC
+
+Simply a (lazy) linked list of characters.
+
+** Index Creation
+
+#+BEGIN_SRC haskell
+  indexDocument :: Index -> FilePath -> Term -> Index
+  
+  createIndex :: [FilePath] -> IO Index
+  createIndex documents =
+    foldM addDocument Map.empty documents
+    where addDocument :: Index -> Term -> IO Index
+          addDocument index document = do
+            contents <- readFile document
+            return (indexDocument index document contents)
+#+END_SRC
+
+- We implement construction of the index as a monadic fold over the
+  documents.
+- The accumulating function reads each document and adds it to the
+  index.
+
+** Monadic Fold
+
+Remember, ~foldM~ has the following type:
+
+#+BEGIN_SRC haskell
+  foldM :: Monad m => (a -> b -> m a) -> a -> [b] -> m a
+#+END_SRC
+
+- Just like ~foldl~ except the function argument yields a monadic value.
+
+** Document Indexing
+
+#+BEGIN_SRC haskell
+  segmentTerms :: Term -> [Term]
+
+  indexDocument :: Index -> FilePath -> Term -> Index
+  indexDocument index docPath contents =
+      Map.unionWith Set.union index .
+      Map.fromList .
+      map (\term -> (term, Set.singleton docPath)) .
+      segmentTerms $ contents
+#+END_SRC
+
+The document is indexed by splitting the document into words with
+~segmentTerms~ and inserting a pointer from each word in the document
+back to the document's path.
+
+** Processing the Documents
+
+#+BEGIN_SRC haskell
+  segmentTerms :: Term -> [Term]
+  segmentTerms contents =
+      words . map toLower .
+      filter (\c -> isSpace c || isAlpha c) $
+      contents
+#+END_SRC
+
+We filter out non-alpha characters, normalize to lower case, and split
+the document into words.
+
+** Querying the Index
+
+- Once we have the index, we can efficiently perform our query.
+- This is accomplished by intersecting the sets of documents which
+  contain each term:
+
+#+BEGIN_SRC haskell
+  queryIndex :: Index -> [Term] -> [FilePath]
+  queryIndex index query =
+      Set.toList . intersections .
+      mapMaybe lookupTerm $ query
+      where lookupTerm term =
+                Map.lookup (map toLower term) index
+#+END_SRC
+
+** Compile and Run
+
+If we run a simple query on a medium-sized corpus, we get...
+
+** Compile and Run (cont'd)
+
+~openFile: resource exhausted (Too many open files)~
+
+** Culprit: readFile
+
+#+BEGIN_SRC haskell
+  readFile :: FilePath -> IO String
+  readFile name = openFile name ReadMode >>= hGetContents
+#+END_SRC
+
+Looks like hGetContents should be cleaning up our file handles, but...
+
+** Lazy I/O!
+
+#+BEGIN_SRC haskell
+  hGetContents :: Handle -> IO String
+#+END_SRC
+
+#+BEGIN_QUOTE
+Computation ~hGetContents hdl~ returns the list of characters
+corresponding to the unread portion of the channel or file managed by
+hdl, *which is put into an intermediate state, semi-closed*. A
+semi-closed handle becomes closed ... *once the entire contents of the
+handle has been read*.
+#+END_QUOTE
+
+** Lazy I/O! (cont'd)
+
+- Lazy I/O means that evaluating pure code can have I/O side effects
+  - Fully evaluating the (pure) list causes the file handle to be
+    deallocated
+- We accumulate a big pile of unevaluated Strings in our ~foldM~
+- This program leaks file handles!
+
+# explain evaluation of readFile in the foldM
+
+* Foiled by Laziness
+
+** Read strictly
+
+- Let's just slurp in the whole file each time
+- This way ~hGetContents~ will clean up after us
+- No more semi-closed handles
+
+** How do we accomplish this?
+
+#+BEGIN_SRC haskell
+  readFile' :: FilePath -> IO String
+  readFile' path =
+      do contents <- readFile path
+         seq (length contents) (return contents)
+#+END_SRC
+
+This forces the entire file to be read before moving on to the next
+file.
+
+** Strictness with ~seq~
+
+- ~seq~ is our strictness primitive
+- Evaluates its first argument and returns its second
+- $seq\  \bot\  x = \bot$
+
+** Update our code
+
+Replace the use of ~readFile~ with our new function in ~addDocument~.
+
+#+BEGIN_SRC haskell
+  addDocument index document = do
+    contents <- readFile' document
+    return (indexDocument index document contents)
+#+END_SRC
+
+- Let's run it: ~./Stage2 docs know between together~
+
+** Performance
+
+- It doesn't crash!
+- But it's slow...
+- ~RSIZE~ in ~top~ is 2,316M
+  - Input documents only total 28M
+  - Something is amiss
+
+** Memory Debugging
+
+- GHC ships with fantastic memory profiling tools
+- Make sure your libraries are compiled with profiling enabled
+- Add this to your ~$HOME/.cabal/config~:
+
+#+BEGIN_SRC conf
+  library-profiling: True
+#+END_SRC
+
+** Memory Debugging (cont'd)
+
+- Compile with ~-prof -fprof-auto~
+- We want to see a timeline of allocations broken out by who allocated them
+- This is given to us by the cost-centre heap profile
+- Re-run with ~+RTS -hc~ to produce the heap profile output
+
+** Heap Profile
+
+[[./Stage2.eps]]
+
+** Heap Profile (cont'd)
+
+- Each color corresponds to a different source of allocation
+- Other annotation methods are available (e.g. ~-hy~ breaks out by type)
+- Interpreting this graph requires reasoning about the program's
+  course of execution
+
+** Heap Profile (cont'd)
+
+- We can see that all of the documents are read in with ~readFile~ at
+  the beginning, and are slowly deallocated as they are indexed
+- We want to deallocate each file after it is read in before moving on
+  to the next one
+
+** Strict folding
+
+#+BEGIN_SRC haskell
+  addDocument index document = do
+    contents <- readFile' document
+    return (indexDocument index document contents)
+#+END_SRC
+
+- ~foldM~ is strict in accumulator
+  - (or at least as strict as ~>>=~)
+- We are using the strict ~Map~ variant
+- But the ~Map~ in the accumulator is lazy
+
+** Strict folding (cont'd)
+
+#+BEGIN_SRC haskell
+  addDocument index document = do
+    contents <- readFile' document
+    let index' = indexDocument index document contents
+    seq index' (return index')
+#+END_SRC
+
+- ~return~ is lazy
+- We need to use the same strategy as with ~readFile~
+- Ensure the index is evaluated at each step
+
+** Heap Profile
+
+[[./Stage3.eps]]
+
+* Revisiting our Representation
+
+** Strings are bad
+
+- Strings are extremely inefficient
+- Linked list of characters
+  - Each character is lazy
+  - Each character has its own lazy cons cell
+
+[[./hello.png]]
+
+- Enter: ~Data.Text~
+
+** Data.Text
+
+#+BEGIN_QUOTE
+An efficient packed Unicode text type.
+#+END_QUOTE
+
+- Written by Bryan O'Sullivan
+- Widely used, highly optimized
+- Dense UTF-16 array representation
+
+** Update our code
+
+Let's update our representation with strict ~Text~:
+
+#+BEGIN_SRC haskell
+  import Data.Text (Text)
+
+  type Term = Text
+#+END_SRC
+
+~text~ also packages a strict, locale-sensitive ~readFile~, obsoleting
+our strict ~readFile~ replacement. Let's update ~addDocument~:
+
+#+BEGIN_SRC haskell
+  addDocument index document = do
+    contents <- Text.readFile document
+    let index' = indexDocument index document contents
+    seq index' (return index')
+#+END_SRC
+
+** Update our code (cont'd)
+
+Now let's replace our ~Data.Char~ methods with their more efficient
+~Data.Text~ equivalents:
+
+#+BEGIN_SRC haskell
+  segmentTerms :: Term -> [Term]
+  segmentTerms contents =
+      Text.words . Text.toLower .
+      Text.filter (\c -> isSpace c || isAlpha c) $
+      contents
+#+END_SRC
+
+And in ~queryIndex~:
+
+#+BEGIN_SRC haskell
+  lookupTerm term = Map.lookup (Text.toLower term) index
+#+END_SRC
+
+** Compile and run
+
+Now our code should use a tiny fraction of the memory owing to the far
+more efficient text representation.
+
+- Let's run it and find out: ~./Stage4 docs know between together +RTS -hc~
+
+** Heap Profile
+
+[[./Stage4.eps]]
+
+** What's going on?
+
+- This is reminiscent of our first heap profile
+- It is a fraction of the size, but clearly asymptotically incorrect
+- We didn't change the strictness of our program
+  - It is building the index as it reads the files
+
+** Cracking the code
+
+- Our biggest hint is in the cost centre that is leaking
+- Note that it's not ~readFile~...
+
+** Data.Text revisited
+
+- ~segmentTerms~ is holding the references to the bulk of the heap
+- Isn't ~Text.words~ breaking up the big block of text and letting the
+  GC do its job?
+
+** ~words~
+
+- In fact, ~words~ as provided by ~Data.Text~ provides /views/ onto
+  the source array
+- Rather than copying the entire string, the list of words share a
+  reference to the same array
+- This is done for efficiency
+- But what if we want copying?
+
+** ~copy~
+
+They thought of that, too!
+
+#+BEGIN_SRC haskell
+  copy :: Text -> Text
+#+END_SRC
+
+#+BEGIN_QUOTE
+O(n) Make a distinct copy of the given string, sharing no storage with
+the original string.
+#+END_QUOTE
+
+Let's add it in:
+#+BEGIN_SRC haskell
+segmentTerms :: Term -> [Term]
+segmentTerms contents =
+    map Text.copy .
+    Text.words . Text.toLower .
+    Text.filter (\c -> isSpace c || isAlpha c) $
+    contents
+#+END_SRC
+
+** Heap Profile
+
+[[./Stage5.eps]]
+
+** Conclusion
+
+- Wonderful! An asymptotic improvement
+- Our spikes are on the order of the size of individual documents
+- We can't do much better than this asymptotically
+
+** Thank You!
+
+- Brought to you by Bitbase
+- We do Haskell consulting
+- Slides are available at https://github.com/bitbasenyc/heap
