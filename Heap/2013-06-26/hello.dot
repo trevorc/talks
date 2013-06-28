@@ -1,0 +1,9 @@
+digraph hello {
+  rankdir="LR";
+  l2 [label="l"];
+  h -> e;
+  e -> l;
+  l -> l2;
+  l2 -> o;
+  o -> "[]";
+}

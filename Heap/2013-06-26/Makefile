@@ -1,6 +1,6 @@
 hs := $(wildcard *.hs)
 exe := $(hs:.hs=)
-ps := Stage2.eps Stage3.eps Stage4.eps Stage5.eps
+ps := Stage2.png Stage3.png Stage4.png Stage5.png hello.png
 query := know between together
 
 .PHONY: all clean
@@ -18,5 +18,11 @@ heap.pdf: heap.org $(ps)
 $(exe): %: %.hs
 	ghc --make -O2 -prof -fprof-auto $<
 
-%.eps: %.hp
-	hp2ps -c -e6in < $< > $@
+%.ps: %.hp
+	hp2ps -c -e6in $<
+
+%.png: %.ps
+	convert -density 300 -flatten $< $@
+
+%.png: %.dot
+	dot -Tpng < $< > $@

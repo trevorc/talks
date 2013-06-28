@@ -3,7 +3,7 @@
 #+AUTHOR: Trevor Caira
 #+DATE: June 26, 2013
 #+EMAIL: trevor@bitba.se
-#+OPTIONS: toc:nil
+#+OPTIONS: toc:nil num:nil
 #+STARTUP: beamer
 #+LaTeX_CLASS: beamer
 #+LaTeX_CLASS_OPTIONS: [bigger]
@@ -422,7 +422,7 @@ Replace the use of ~readFile~ with our new function in ~addDocument~.
 
 ** Heap Profile
 
-[[./Stage2.eps]]
+[[./Stage2.png]]
 
 ** Heap Profile (cont'd)
 
@@ -466,7 +466,7 @@ Replace the use of ~readFile~ with our new function in ~addDocument~.
 
 ** Heap Profile
 
-[[./Stage3.eps]]
+[[./Stage3.png]]
 
 * Revisiting our Representation
 
@@ -539,7 +539,7 @@ more efficient text representation.
 
 ** Heap Profile
 
-[[./Stage4.eps]]
+[[./Stage4.png]]
 
 ** What's going on?
 
@@ -593,7 +593,7 @@ segmentTerms contents =
 
 ** Heap Profile
 
-[[./Stage5.eps]]
+[[./Stage5.png]]
 
 ** Conclusion
 
